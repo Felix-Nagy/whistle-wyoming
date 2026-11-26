@@ -3,10 +3,12 @@
 import argparse
 import array
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
+import sys
 import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
@@ -121,50 +123,70 @@ LANG_DATA = {
     }
 }
 
-# Filled from LANG_DATA for the configured language in main().
-BASE_KEYWORDS = set()
-STOPWORDS = set()
+def lang_profile(language: str) -> dict:
+    return LANG_DATA.get(language, LANG_DATA["en"])
 
-def _split_words(text: str) -> list[str]:
+
+def normalize_language(language: str | None) -> str | None:
+    """"de-DE" / "de_CH" / "DE" -> "de"; None if Whistle doesn't support it."""
+    if not language:
+        return None
+    base = re.split(r"[-_]", language.strip().lower(), maxsplit=1)[0]
+    return base if base in LANGUAGES else None
+
+
+def _split_words(text: str, stopwords: set[str] = frozenset()) -> list[str]:
     cleaned = re.sub(r"[^\w\s]", " ", text.lower())
-    return [w for w in cleaned.split() if len(w) > 2 and w not in STOPWORDS and not w.isdigit()]
+    return [w for w in cleaned.split() if len(w) > 2 and w not in stopwords and not w.isdigit()]
 
 
 def _ws_url(ha_url: str) -> str:
     return re.sub(r"^http", "ws", ha_url.rstrip("/")) + "/api/websocket"
 
 
-async def _ha_ws_fetch(ha_url: str, token: str, commands: list[str | dict]) -> list:
-    """Authenticate to the HA websocket API and run commands, returning their results in order.
+class _HAWebsocket:
+    """One authenticated HA websocket connection; call() runs commands and returns their results."""
 
-    Each command is a message type, or a dict with "type" plus extra fields."""
+    def __init__(self, ws):
+        self.ws = ws
+        self.next_id = 1
+
+    async def call(self, commands: list[str | dict]) -> list:
+        """Each command is a message type, or a dict with "type" plus extra fields."""
+        messages = {}
+        for command in commands:
+            message = command if isinstance(command, dict) else {"type": command}
+            messages[self.next_id] = message
+            await self.ws.send(json.dumps({**message, "id": self.next_id}))
+            self.next_id += 1
+        results: dict[int, object] = {}
+        while len(results) < len(messages):
+            msg = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=30))
+            if msg.get("type") != "result" or msg.get("id") not in messages:
+                continue
+            if not msg.get("success"):
+                raise RuntimeError(f"{messages[msg['id']]['type']} failed: {msg.get('error')}")
+            results[msg["id"]] = msg["result"]
+        return [results[i] for i in sorted(messages)]
+
+
+@contextlib.asynccontextmanager
+async def _ha_ws(ha_url: str, token: str):
     async with connect(_ws_url(ha_url), max_size=64 * 1024 * 1024, open_timeout=10) as ws:
-        msg = json.loads(await ws.recv())
+        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
         if msg.get("type") != "auth_required":
             raise RuntimeError(f"unexpected HA hello: {msg.get('type')}")
         await ws.send(json.dumps({"type": "auth", "access_token": token}))
-        msg = json.loads(await ws.recv())
+        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
         if msg.get("type") != "auth_ok":
             raise RuntimeError(f"HA auth failed: {msg.get('message', msg.get('type'))}")
-
-        messages = [c if isinstance(c, dict) else {"type": c} for c in commands]
-        for i, message in enumerate(messages, start=1):
-            await ws.send(json.dumps({**message, "id": i}))
-        results: dict[int, object] = {}
-        while len(results) < len(commands):
-            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
-            if msg.get("type") != "result":
-                continue
-            if not msg.get("success"):
-                raise RuntimeError(f"{messages[msg['id'] - 1]['type']} failed: {msg.get('error')}")
-            results[msg["id"]] = msg["result"]
-        return [results[i] for i in range(1, len(commands) + 1)]
+        yield _HAWebsocket(ws)
 
 
-def _add_name(keywords: set[str], name: str | None) -> None:
-    if name and name.strip():
-        keywords.add(name.strip().lower())
-        keywords.update(_split_words(name))
+async def _ha_ws_fetch(ha_url: str, token: str, commands: list[str | dict]) -> list:
+    """Authenticate to the HA websocket API and run commands, returning their results in order."""
+    async with _ha_ws(ha_url, token) as ha:
+        return await ha.call(commands)
 
 
 def parse_extra_keywords(value: str | None) -> set[str]:
@@ -177,77 +199,131 @@ def _rank(keywords: set[str]) -> list[str]:
     return sorted(keywords, key=lambda k: (-len(k.split()), k))
 
 
-async def fetch_ha_keywords(ha_url: str, token: str, max_keywords: int,
-                            fixed: set[str] = frozenset()) -> list[str]:
-    """Names + aliases of entities exposed to Assist, plus area names + aliases.
+async def fetch_ha_names(ha_url: str, token: str) -> tuple[list[str], list[str], int]:
+    """Area names + aliases, and the names people use for entities exposed to Assist.
 
-    `fixed` keywords (base + extra) are always kept; the HA-derived ones fill the rest of
-    `max_keywords`, so a growing install can't push the command words out."""
-    exposure, areas, states = await _ha_ws_fetch(ha_url, token, [
-        "homeassistant/expose_entity/list",
-        "config/area_registry/list",
-        "get_states",
-    ])
+    For an entity with aliases only the aliases are used (they're what people actually say;
+    entity names are often technical), otherwise its friendly name.
+    Returns (area_names, entity_names, number_of_exposed_entities)."""
+    async with _ha_ws(ha_url, token) as ha:
+        exposure, areas, states = await ha.call([
+            "homeassistant/expose_entity/list",
+            "config/area_registry/list",
+            "get_states",
+        ])
+        exposed = {eid for eid, opts in exposure.get("exposed_entities", {}).items()
+                   if opts.get("conversation")}
+        if not exposed:
+            _LOGGER.warning("No entities exposed to Assist; falling back to domain filter")
+            exposed = {s["entity_id"] for s in states if s["entity_id"].split(".", 1)[0] in VOICE_DOMAINS}
+        # config/entity_registry/list omits aliases; get_entries returns the full entries.
+        (entries,) = await ha.call([
+            {"type": "config/entity_registry/get_entries", "entity_ids": sorted(exposed)},
+        ])
 
-    exposed = {eid for eid, opts in exposure.get("exposed_entities", {}).items()
-               if opts.get("conversation")}
-    if not exposed:
-        _LOGGER.warning("No entities exposed to Assist; falling back to domain filter")
-        exposed = {s["entity_id"] for s in states if s["entity_id"].split(".", 1)[0] in VOICE_DOMAINS}
-
-    # config/entity_registry/list omits aliases; get_entries returns the full entries.
-    (entries,) = await _ha_ws_fetch(ha_url, token, [
-        {"type": "config/entity_registry/get_entries", "entity_ids": sorted(exposed)},
-    ])
-    keywords: set[str] = set()
-    # Aliases are what people actually say; when an entity has them, skip its (often technical) name.
     aliases_by_entity = {
         entity_id: [a for a in (entry.get("aliases") or []) if a]
         for entity_id, entry in entries.items() if entry
     }
+    entity_names: list[str] = []
     for state in states:
         entity_id = state["entity_id"]
         if entity_id not in exposed:
             continue
         aliases = aliases_by_entity.get(entity_id)
-        if aliases:
-            for alias in aliases:
-                _add_name(keywords, alias)
-        else:
-            _add_name(keywords, (state.get("attributes") or {}).get("friendly_name"))
-    for area in areas:
-        for name in [area.get("name"), *(area.get("aliases") or [])]:
-            if name:
-                keywords.add(name.strip().lower())
+        entity_names.extend(aliases or [(state.get("attributes") or {}).get("friendly_name")])
+    area_names = [name for area in areas for name in [area.get("name"), *(area.get("aliases") or [])]]
+    clean = lambda names: sorted({n.strip().lower() for n in names if n and n.strip()})
+    return clean(area_names), clean(entity_names), len(exposed)
 
-    from_ha = keywords - fixed
-    _LOGGER.info("%d entities exposed to Assist -> %d keywords (+ %d base/extra)",
-                 len(exposed), len(from_ha), len(fixed))
-    kept = set(_rank(from_ha)[:max(0, max_keywords - len(fixed))])
-    return _rank(kept | fixed)
+
+def build_keywords(language: str, area_names: list[str], entity_names: list[str],
+                   extra: set[str], max_keywords: int) -> list[str]:
+    """The keyword list for one language, at most `max_keywords` long (unless base + extra alone are more).
+
+    Base (per language) and extra keywords are always kept. The HA-derived ones fill the rest, by
+    priority: area names, then full entity names/aliases, then single words split out of entity
+    names. Within a tier, longer phrases first. Without the tiers a large install would cut the
+    single-word areas and names alphabetically (everything after "m..." gone)."""
+    profile = lang_profile(language)
+    fixed = set(profile["keywords"]) | set(extra)
+    stopwords = profile["stopwords"]
+    tiers = [set(area_names), set(entity_names),
+             {w for name in entity_names for w in _split_words(name, stopwords)}]
+    seen = set(fixed)
+    ranked: list[str] = []
+    for tier in tiers:
+        tier -= seen
+        seen |= tier
+        ranked.extend(_rank(tier))
+    return _rank(fixed | set(ranked[:max(0, max_keywords - len(fixed))]))
+
+
+async def fetch_ha_keywords(ha_url: str, token: str, max_keywords: int,
+                            extra: set[str] = frozenset(), language: str = "en") -> list[str]:
+    area_names, entity_names, _ = await fetch_ha_names(ha_url, token)
+    return build_keywords(language, area_names, entity_names, extra, max_keywords)
 
 
 class KeywordStore:
     def __init__(self, ha_url: str | None, token: str | None, max_keywords: int,
-                 extra: set[str] = frozenset()):
+                 extra: set[str] = frozenset(), language: str = "en"):
         self.ha_url, self.token, self.max_keywords = ha_url, token, max_keywords
-        self.fixed = set(BASE_KEYWORDS) | set(extra)
-        self.keywords: list[str] = _rank(self.fixed)
+        self.extra = set(extra)
+        self.language = language
+        self.area_names: list[str] = []
+        self.entity_names: list[str] = []
+        self._cache: dict[str, list[str]] = {}
+
+    def keywords_for(self, language: str) -> list[str]:
+        """Keyword list for `language`: its own base words and stopwords, the same HA names."""
+        if language not in self._cache:
+            self._cache[language] = build_keywords(language, self.area_names, self.entity_names,
+                                                   self.extra, self.max_keywords)
+        return self._cache[language]
+
+    @property
+    def keywords(self) -> list[str]:
+        return self.keywords_for(self.language)
 
     async def refresh(self) -> None:
         if not (self.ha_url and self.token):
             _LOGGER.warning("HA_URL/HA_TOKEN not set: using only base/extra keywords")
             return
         try:
-            self.keywords = await fetch_ha_keywords(self.ha_url, self.token, self.max_keywords, self.fixed)
-            _LOGGER.info("Loaded %d keywords from HA, e.g. %s", len(self.keywords), self.keywords[:10])
+            area_names, entity_names, exposed = await fetch_ha_names(self.ha_url, self.token)
         except Exception as err:
             _LOGGER.error("Keyword refresh from HA failed (keeping previous list): %s", err)
+            return
+        if (area_names, entity_names) == (self.area_names, self.entity_names):
+            _LOGGER.debug("Keywords from HA unchanged (%d entities exposed)", exposed)
+            return
+        self.area_names, self.entity_names = area_names, entity_names
+        self._cache.clear()
+        keywords = self.keywords
+        _LOGGER.info("%d entities exposed to Assist, %d areas/aliases -> %d keywords, e.g. %s",
+                     exposed, len(area_names), len(keywords), keywords[:10])
 
     async def refresh_forever(self, interval: int) -> None:
         while True:
             await asyncio.sleep(interval)
             await self.refresh()
+
+
+def pcm16_to_float(raw: bytes) -> array.array:
+    """16-bit little-endian PCM -> float32 samples in [-1, 1], as cactus wants them.
+
+    Raw bytes would be silently misread as float32."""
+    pcm = array.array("h")
+    pcm.frombytes(raw[: len(raw) // 2 * 2])
+    if sys.byteorder == "big":
+        pcm.byteswap()
+    return array.array("f", [s / 32768.0 for s in pcm])
+
+
+def transcribe_pcm(raw: bytes, language: str, keywords: list[str]) -> dict:
+    """Runs on the single inference thread: conversion included, so the event loop never waits on it."""
+    return cactus.transcribe(pcm16_to_float(raw), language=language, keywords=keywords or None)
 
 
 def save_recording(directory: Path, max_files: int, pcm: bytes, meta: dict) -> Path:
@@ -285,6 +361,8 @@ class WhistleEventHandler(AsyncEventHandler):
         self.converter = AudioChunkConverter(rate=SAMPLE_RATE, width=2, channels=1)
         self.audio = bytearray()
         self.language = args.language
+        self.max_bytes = max(0, int(getattr(args, "max_seconds", 0) * SAMPLE_RATE)) * 2
+        self.truncated = False
 
     async def handle_event(self, event: Event) -> bool:
         if Describe.is_type(event.type):
@@ -293,44 +371,55 @@ class WhistleEventHandler(AsyncEventHandler):
 
         if Transcribe.is_type(event.type):
             transcribe = Transcribe.from_event(event)
-            if transcribe.language in LANGUAGES:
-                self.language = transcribe.language
+            language = normalize_language(transcribe.language)
+            if language:
+                self.language = language
+            elif transcribe.language:
+                _LOGGER.debug("Unsupported language %r, using %s", transcribe.language, self.language)
             return True
 
         if AudioStart.is_type(event.type):
             self.audio = bytearray()
+            self.truncated = False
             return True
 
         if AudioChunk.is_type(event.type):
+            if self.max_bytes and len(self.audio) >= self.max_bytes:
+                if not self.truncated:
+                    _LOGGER.warning("Audio longer than %ss, ignoring the rest", self.args.max_seconds)
+                    self.truncated = True
+                return True
             chunk = self.converter.convert(AudioChunk.from_event(event))
             self.audio.extend(chunk.audio)
             return True
 
         if AudioStop.is_type(event.type):
-            # cactus wants float32 samples in [-1, 1]; raw bytes would be misread as float32.
-            raw = bytes(self.audio)
-            pcm = array.array("h")
-            pcm.frombytes(raw)
-            samples = array.array("f", (s / 32768.0 for s in pcm))
+            raw = bytes(self.audio[: self.max_bytes] if self.max_bytes else self.audio)
             self.audio = bytearray()
+            seconds = len(raw) / 2 / SAMPLE_RATE
 
-            keywords = self.store.keywords
+            keywords = self.store.keywords_for(self.language)
+            text, error = "", None
             start = time.monotonic()
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                self.executor,
-                partial(cactus.transcribe, samples, language=self.language,
-                        keywords=keywords or None),
-            )
+            if len(raw) < 2:
+                _LOGGER.warning("AudioStop without audio")
+            else:
+                try:
+                    result = await asyncio.get_running_loop().run_in_executor(
+                        self.executor, partial(transcribe_pcm, raw, self.language, keywords))
+                    text = (result.get("text") or "").strip()
+                except Exception as err:
+                    # Still answer (with an empty transcript), or HA waits for its own timeout.
+                    error = str(err)
+                    _LOGGER.exception("Transcription failed")
             elapsed_ms = (time.monotonic() - start) * 1000
-            text = (result.get("text") or "").strip()
-            _LOGGER.info("[%s] %.1fs audio -> %r (%.0f ms)", self.language,
-                         len(samples) / SAMPLE_RATE, text, elapsed_ms)
+            _LOGGER.info("[%s] %.1fs audio -> %r (%.0f ms)", self.language, seconds, text, elapsed_ms)
 
-            if self.args.save_audio:
-                meta = {"text": text, "language": self.language,
-                        "seconds": round(len(samples) / SAMPLE_RATE, 2),
+            if self.args.save_audio and raw:
+                meta = {"text": text, "language": self.language, "seconds": round(seconds, 2),
                         "elapsed_ms": round(elapsed_ms), "keywords": keywords}
+                if error:
+                    meta["error"] = error
                 try:
                     path = await asyncio.to_thread(save_recording, Path(self.args.save_audio),
                                                    self.args.save_audio_max, raw, meta)
@@ -339,7 +428,7 @@ class WhistleEventHandler(AsyncEventHandler):
                     # A full or read-only disk must not break voice commands.
                     _LOGGER.error("Could not save the recording: %s", err)
             try:
-                await self.write_event(Transcript(text=text).event())
+                await self.write_event(Transcript(text=text, language=self.language).event())
             except (ConnectionResetError, BrokenPipeError):
                 # HA gave up on this pipeline run (timeout/cancel) before we answered.
                 _LOGGER.warning("Client disconnected before the transcript was sent")
@@ -362,16 +451,16 @@ async def main() -> None:
                         help="Directory to save each request's audio + transcript in (off when empty)")
     parser.add_argument("--save-audio-max", type=int, default=int(os.getenv("WHISTLE_SAVE_AUDIO_MAX", "500")),
                         help="Keep only the newest N recordings (0 = no limit)")
-    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--max-seconds", type=float, default=float(os.getenv("WHISTLE_MAX_SECONDS", "30")),
+                        help="Ignore audio past this many seconds per request (0 = no limit)")
+    parser.add_argument("--debug", action="store_true", default=os.getenv("WHISTLE_DEBUG", "") not in ("", "0"))
     args = parser.parse_args()
-    
-    # Inject the language profile before init
-    lang_profile = LANG_DATA.get(args.language, LANG_DATA["en"])
-    BASE_KEYWORDS.update(lang_profile["keywords"])
-    STOPWORDS.update(lang_profile["stopwords"])
-    
+
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # Their DEBUG output is frame-level noise, and websockets' includes part of the HA token.
+    for name in ("websockets", "httpcore", "httpcore2", "httpx", "httpx2", "filelock", "urllib3"):
+        logging.getLogger(name).setLevel(max(logging.INFO, logging.getLogger(name).level))
 
     extra = parse_extra_keywords(args.extra_keywords)
     if extra:
@@ -379,10 +468,12 @@ async def main() -> None:
     if args.save_audio:
         _LOGGER.info("Saving recordings to %s (newest %s kept)", args.save_audio,
                      args.save_audio_max or "all")
-    store = KeywordStore(args.ha_url, os.getenv("HA_TOKEN"), args.max_keywords, extra)
+    store = KeywordStore(args.ha_url, os.getenv("HA_TOKEN"), args.max_keywords, extra, args.language)
     await store.refresh()
+    refresh_task = None
     if args.refresh_interval > 0:
-        asyncio.create_task(store.refresh_forever(args.refresh_interval))
+        # Keep a reference: the event loop holds tasks only weakly.
+        refresh_task = asyncio.create_task(store.refresh_forever(args.refresh_interval))
 
     # Load engine + weights once (downloads on first run), off the event loop.
     # The engine holds one global model, so all inference goes through a single worker thread.
@@ -410,7 +501,12 @@ async def main() -> None:
 
     server = AsyncServer.from_uri(args.uri)
     _LOGGER.info("Listening on %s", args.uri)
-    await server.run(partial(WhistleEventHandler, info, args, store, executor))
+    try:
+        await server.run(partial(WhistleEventHandler, info, args, store, executor))
+    finally:
+        if refresh_task:
+            refresh_task.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":

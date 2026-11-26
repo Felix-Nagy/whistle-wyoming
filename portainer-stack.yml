@@ -18,6 +18,7 @@ services:
       WHISTLE_EXTRA_KEYWORDS: ${WHISTLE_EXTRA_KEYWORDS:-}  # e.g. "yerba, dulce de leche"
       WHISTLE_SAVE_AUDIO: ${WHISTLE_SAVE_AUDIO:-}  # e.g. /recordings: save each request's audio + transcript
       WHISTLE_SAVE_AUDIO_MAX: ${WHISTLE_SAVE_AUDIO_MAX:-500}
+      WHISTLE_MAX_SECONDS: ${WHISTLE_MAX_SECONDS:-30}
       CACTUS_TELEMETRY: "0"  # cactus-compute sends usage counts by default
       HF_HUB_DISABLE_TELEMETRY: "1"
     volumes:

@@ -16,7 +16,11 @@ names you actually say get favoured during decoding:
   "apagar";
 - any extra words you list in `WHISTLE_EXTRA_KEYWORDS`.
 
-The base and extra keywords are always kept; the HA-derived ones fill the rest of `WHISTLE_MAX_KEYWORDS`.
+The base and extra keywords are always kept; the HA-derived ones fill the rest of `WHISTLE_MAX_KEYWORDS`, by
+priority: area names first, then full entity names/aliases, then single words split out of entity names.
+
+The base keywords and stopwords follow the language of each request: if the pipeline asks for `de` (or `de-DE`),
+the German set is used even when `WHISTLE_LANGUAGE` is `en`.
 
 The list is read over the HA websocket API at startup and refreshed periodically. If HA can't be reached, the server
 keeps the previous list and keeps transcribing.
@@ -58,6 +62,8 @@ In Home Assistant, add the **Wyoming Protocol** integration with host `127.0.0.1
 | `WHISTLE_EXTRA_KEYWORDS` | (empty) | Comma-separated words or phrases always added, e.g. `yerba, dulce de leche` |
 | `WHISTLE_SAVE_AUDIO` | (empty = off) | Directory to save every request in, e.g. `/recordings` (mount a volume there) |
 | `WHISTLE_SAVE_AUDIO_MAX` | `500` | Keep only the newest N recordings (`0` = no limit) |
+| `WHISTLE_MAX_SECONDS` | `30` | Ignore audio past this many seconds per request, so a stuck VAD can't grow memory (`0` = no limit) |
+| `WHISTLE_DEBUG` | (empty) | `1` for debug logging |
 
 `CACTUS_TELEMETRY=0` is set in the stack: cactus-compute sends anonymous usage counts by default.
 
@@ -82,6 +88,9 @@ said after the wake word, so leave it off unless you need it.
   float32, so audio is converted first. Incoming audio of any rate/width/channels is converted to 16 kHz mono.
 - The engine holds one global model, so all inference runs on a single worker thread off the event loop.
 - Entity aliases come from `config/entity_registry/get_entries`; `config/entity_registry/list` omits them.
+- If transcription fails, an empty transcript is still sent, so HA ends the pipeline run at once instead of
+  waiting for its own timeout.
+- The keyword refresh is logged at INFO only when the list changed.
 
 ## License
 
